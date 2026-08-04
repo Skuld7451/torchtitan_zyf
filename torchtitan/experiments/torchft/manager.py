@@ -17,6 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed._composable.fsdp.fully_shard import FSDPModule
+from torch.distributed._composable.replicate_with_fsdp import ReplicateModule
 from torch.distributed.distributed_c10d import ReduceOp
 
 from torchtitan.config import Configurable
@@ -47,7 +48,9 @@ class TorchFTManager(Configurable):
 
         process_group: str = "gloo"
         """
-        The process group to use for fault tolerance. Currently, only "gloo" and "nccl" are supported.
+        The process group to use for fault tolerance. The base implementation
+        supports "gloo", "nccl", and "mccl". Accelerator integrations may
+        override ``_create_process_group`` to add another backend.
         """
 
         process_group_timeout_ms: int = 10000
@@ -76,6 +79,26 @@ class TorchFTManager(Configurable):
         (https://github.com/pytorch/torchft/blob/360c5c534bdeac959507e9d238ba9f3902d3fda9/torchft/local_sgd.py#L41)
         """
 
+    def _create_process_group(self, name: str, timeout: timedelta):
+        """Create the reconfigurable process group used by TorchFT."""
+        if name == "gloo":
+            return torchft.ProcessGroupGloo(timeout=timeout)
+        if name == "nccl":
+            return torchft.ProcessGroupNCCL(timeout=timeout)
+        if name == "mccl":
+            import torchcomms
+            from torchft.torchcomms import ProcessGroupTorchComms
+
+            comm = torchcomms.new_comm(
+                "mccl",
+                device=torch.device("cuda"),
+                name="mccl_ft",
+                timeout=timeout,
+                enable_reconfigure=True,
+            )
+            return ProcessGroupTorchComms(comm, timeout=timeout)
+        raise ValueError(f"Unsupported process group: {name}")
+
     def __init__(
         self,
         config: Config,
@@ -87,25 +110,12 @@ class TorchFTManager(Configurable):
         if not has_torchft:
             raise ImportError("torchft is not installed. Please install it.")
 
-        process_group_timeout = timedelta(milliseconds=config.process_group_timeout_ms)
-        if config.process_group == "gloo":
-            pg = torchft.ProcessGroupGloo(timeout=process_group_timeout)
-        elif config.process_group == "nccl":
-            pg = torchft.ProcessGroupNCCL(timeout=process_group_timeout)
-        elif config.process_group == "mccl":
-            import torchcomms
-            from torchft.torchcomms import ProcessGroupTorchComms
+        method = config.semi_sync_method
+        if isinstance(method, str) and method.lower() in ("", "none", "null"):
+            config.semi_sync_method = None
 
-            comm = torchcomms.new_comm(
-                "mccl",
-                device=torch.device("cuda"),
-                name="mccl_ft",
-                timeout=process_group_timeout,
-                enable_reconfigure=True,
-            )
-            pg = ProcessGroupTorchComms(comm, timeout=process_group_timeout)
-        else:
-            raise ValueError(f"Unsupported process group: {config.process_group}")
+        process_group_timeout = timedelta(milliseconds=config.process_group_timeout_ms)
+        pg = self._create_process_group(config.process_group, process_group_timeout)
 
         # If the training method is specific, then the quorum should be synchronous
         self.use_async_quorum = config.semi_sync_method is None
@@ -121,7 +131,7 @@ class TorchFTManager(Configurable):
         self.group_size = config.group_size
         self.replica_id = config.replica_id
 
-        if self.use_async_quorum:
+        if self.use_async_quorum and self.group_size > 1:
             self.replicate_pg = torchft.process_group.ManagedProcessGroup(self._manager)
             self.replicate_pg.register("dp_replicate")
 
@@ -141,23 +151,35 @@ class TorchFTManager(Configurable):
             return dp_degree, dp_rank
 
     def maybe_set_all_reduce_hook(self, model_parts: list[torch.nn.Module]) -> None:
-        if self.enabled and self.use_async_quorum:
+        if not (self.enabled and self.use_async_quorum) or self.group_size <= 1:
+            return
 
-            def all_reduce_hook(output):
-                dist.all_reduce(output, group=self.replicate_pg, op=ReduceOp.AVG)
+        def all_reduce_hook(output):
+            dist.all_reduce(output, group=self.replicate_pg, op=ReduceOp.AVG)
 
-            def apply_set_all_reduce_hook(m):
-                if isinstance(m, FSDPModule):
-                    m.set_all_reduce_hook(all_reduce_hook)
+        num_data_parallel_modules = 0
 
-            for model_part in model_parts:
-                model_part.apply(apply_set_all_reduce_hook)
+        def apply_set_all_reduce_hook(module):
+            nonlocal num_data_parallel_modules
+            if isinstance(module, (ReplicateModule, FSDPModule)):
+                module.set_all_reduce_hook(all_reduce_hook)
+                num_data_parallel_modules += 1
+
+        for model_part in model_parts:
+            model_part.apply(apply_set_all_reduce_hook)
+
+        if num_data_parallel_modules == 0:
+            raise RuntimeError(
+                "TorchFT synchronous multi-replica training requires the model "
+                "to use replicate-only DP or FSDP, but no supported "
+                "data-parallel module was found."
+            )
 
     @property
     def loss_sync_pg(
         self,
     ) -> "torchft.process_group.ManagedProcessGroup" | None:
-        if self.enabled and self.use_async_quorum:
+        if self.enabled and self.use_async_quorum and self.group_size > 1:
             return self.replicate_pg
         else:
             # skip loss sync when using semi-sync training
@@ -181,6 +203,13 @@ def maybe_semi_sync_training(
 
     extend_ft_config = cast(ExtendedTorchFTConfig, ft_config)
     semi_sync_method = extend_ft_config.semi_sync_method
+    if isinstance(semi_sync_method, str) and semi_sync_method.lower() in (
+        "",
+        "none",
+        "null",
+    ):
+        semi_sync_method = None
+        extend_ft_config.semi_sync_method = None
     if extend_ft_config.enable and semi_sync_method is not None:
         from torchft import local_sgd
 
@@ -221,6 +250,9 @@ def maybe_semi_sync_training(
                 model=model,
                 optimizer=optimizer,
                 sync_every=extend_ft_config.sync_steps,
+                offload_averaged_parameters_to_cpu=(
+                    extend_ft_config.local_sgd_offload_to_cpu
+                ),
             )
         else:
             raise ValueError(
